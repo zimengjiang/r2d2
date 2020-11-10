@@ -11,6 +11,7 @@ import torch
 from tools import common
 from tools.dataloader import norm_RGB
 from nets.patchnet import *
+from pathlib import Path
 
 
 def load_network(model_fn): 
@@ -107,10 +108,63 @@ def extract_multiscale( net, img, detector, scale_f=2**0.25,
     D = torch.cat(D)
     return XYS, D, scores
 
+def extract_and_save_originalscale( net, img, detector):
+    old_bm = torch.backends.cudnn.benchmark 
+    torch.backends.cudnn.benchmark = False # speedup
+    
+    # extract keypoints at multiple scales
+    B, three, H, W = img.shape
+    assert B == 1 and three == 3, "should be a batch with a single RGB image"
+    
+    s = 1.0 # current scale factor
+    
+    X,Y,S,C,Q,D = [],[],[],[],[],[]
 
-def extract_keypoints(args):
+    # if verbose: print(f"extracting at scale x{s:.02f} = {W:4d}x{H:3d}")
+    # extract descriptors
+    with torch.no_grad():
+        res = net(imgs=[img])
+        
+    # get output and reliability map
+    descriptors = res['descriptors'][0]
+    reliability = res['reliability'][0]
+    repeatability = res['repeatability'][0]
+
+    # normalize the reliability for nms
+    # extract maxima and descs
+    y,x = detector(**res) # nms
+    c = reliability[0,0,y,x]
+    q = repeatability[0,0,y,x]
+    d = descriptors[0,:,y,x].t()
+    n = d.shape[0]
+
+    # accumulate multiple scales
+    X.append(x.float())
+    Y.append(y.float())
+    S.append((32/s) * torch.ones(n, dtype=torch.float32, device=d.device))
+    C.append(c)
+    Q.append(q)
+    D.append(d)
+
+
+    # restore value
+    torch.backends.cudnn.benchmark = old_bm
+
+    Y = torch.cat(Y)
+    X = torch.cat(X)
+    S = torch.cat(S) # scale
+    scores = torch.cat(C) * torch.cat(Q) # scores = reliability * repeatability
+    XYS = torch.stack([X,Y,S], dim=-1)
+    D = torch.cat(D)
+    return XYS, D, scores
+
+def extract_keypoints(args, root_to_current_dataset):
     iscuda = common.torch_set_gpu(args.gpu)
-
+    output_folder = 'r2d2_features'
+    rgb_folder = 'rgb.txt'
+    root_to_save_features = root_to_current_dataset+ '/' + output_folder
+    if not os.path.exists(root_to_save_features):
+        os.makedirs(root_to_save_features)
     # load the network...
     net = load_network(args.model)
     if iscuda: net = net.cuda()
@@ -119,41 +173,35 @@ def extract_keypoints(args):
     detector = NonMaxSuppression(
         rel_thr = args.reliability_thr, 
         rep_thr = args.repeatability_thr)
-
-    while args.images:
-        img_path = args.images.pop(0)
-        
-        if img_path.endswith('.txt'):
-            args.images = open(img_path).read().splitlines() + args.images
-            continue
-        
+    
+    imgs_under_current_folder = np.loadtxt(Path(root_to_current_dataset,'rgb.txt'), dtype=str)
+    for img in imgs_under_current_folder:
+        img_path = img[-1]
+        img_name = img[0].split('/')[-1]
         print(f"\nExtracting features for {img_path}")
-        img = Image.open(img_path).convert('RGB')
-        W, H = img.size
+        img = Image.open(Path(root_to_current_dataset, img_path)).convert('RGB')
+            
         img = norm_RGB(img)[None] 
         if iscuda: img = img.cuda()
         
         # extract keypoints/descriptors for a single image
-        xys, desc, scores = extract_multiscale(net, img, detector,
-            scale_f   = args.scale_f, 
-            min_scale = args.min_scale, 
-            max_scale = args.max_scale,
-            min_size  = args.min_size, 
-            max_size  = args.max_size, 
-            verbose = True)
+        xys, desc, scores = extract_and_save_originalscale( net, img, detector)
 
         xys = xys.cpu().numpy()
         desc = desc.cpu().numpy()
         scores = scores.cpu().numpy()
         idxs = scores.argsort()[-args.top_k or None:]
         
-        outpath = img_path + '.' + args.tag
+        outpath = Path(root_to_save_features,img_name[:-4])
+        
         print(f"Saving {len(idxs)} keypoints to {outpath}")
-        np.savez(open(outpath,'wb'), 
-            imsize = (W,H),
-            keypoints = xys[idxs], 
-            descriptors = desc[idxs], 
-            scores = scores[idxs])
+        np.save(outpath, desc[idxs])
+
+        #np.savez(open(outpath,'wb'), 
+         #   imsize = (W,H),
+          #  keypoints = xys[idxs], 
+           # descriptors = desc[idxs], 
+            #scores = scores[idxs])
 
 
 
@@ -162,7 +210,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser("Extract keypoints for a given image")
     parser.add_argument("--model", type=str, required=True, help='model path')
     
-    parser.add_argument("--images", type=str, required=True, nargs='+', help='images / list')
+    parser.add_argument("--images", type=str, nargs='+', help='images / list')
     parser.add_argument("--tag", type=str, default='r2d2', help='output file tag')
     
     parser.add_argument("--top-k", type=int, default=5000, help='number of keypoints')
@@ -177,7 +225,13 @@ if __name__ == '__main__':
     parser.add_argument("--repeatability-thr", type=float, default=0.7)
 
     parser.add_argument("--gpu", type=int, nargs='+', default=[0], help='use -1 for CPU')
+
+    parser.add_argument("--datasets", type=str)
     args = parser.parse_args()
 
-    extract_keypoints(args)
+    all_datasets = np.loadtxt(args.datasets,dtype=str)
+    root = '/local/home/zjiang/data/eth3d/training'
+    for dataset in all_datasets:
+        root_to_current_dataset = root + '/' + dataset
+        extract_keypoints(args, root_to_current_dataset)
 
