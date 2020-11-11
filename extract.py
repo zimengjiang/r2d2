@@ -108,7 +108,7 @@ def extract_multiscale( net, img, detector, scale_f=2**0.25,
     D = torch.cat(D)
     return XYS, D, scores
 
-def extract_and_save_originalscale( net, img, detector):
+def extract_and_save_byscale( net, img, detector, scale_f):
     old_bm = torch.backends.cudnn.benchmark 
     torch.backends.cudnn.benchmark = False # speedup
     
@@ -116,9 +116,10 @@ def extract_and_save_originalscale( net, img, detector):
     B, three, H, W = img.shape
     assert B == 1 and three == 3, "should be a batch with a single RGB image"
     
-    s = 1.0 # current scale factor
-    
-    X,Y,S,C,Q,D = [],[],[],[],[],[]
+    s = 1.0/scale_f # current scale factor
+    # down-scale the image for next iteration
+    nh, nw = round(H*s), round(W*s)
+    img = F.interpolate(img, (nh,nw), mode='bilinear', align_corners=False)
 
     # if verbose: print(f"extracting at scale x{s:.02f} = {W:4d}x{H:3d}")
     # extract descriptors
@@ -127,40 +128,13 @@ def extract_and_save_originalscale( net, img, detector):
         
     # get output and reliability map
     descriptors = res['descriptors'][0]
-    reliability = res['reliability'][0]
-    repeatability = res['repeatability'][0]
+    # reliability = res['reliability'][0]
+    # repeatability = res['repeatability'][0]
+    return descriptors
 
-    # normalize the reliability for nms
-    # extract maxima and descs
-    y,x = detector(**res) # nms
-    c = reliability[0,0,y,x]
-    q = repeatability[0,0,y,x]
-    d = descriptors[0,:,y,x].t()
-    n = d.shape[0]
-
-    # accumulate multiple scales
-    X.append(x.float())
-    Y.append(y.float())
-    S.append((32/s) * torch.ones(n, dtype=torch.float32, device=d.device))
-    C.append(c)
-    Q.append(q)
-    D.append(d)
-
-
-    # restore value
-    torch.backends.cudnn.benchmark = old_bm
-
-    Y = torch.cat(Y)
-    X = torch.cat(X)
-    S = torch.cat(S) # scale
-    scores = torch.cat(C) * torch.cat(Q) # scores = reliability * repeatability
-    XYS = torch.stack([X,Y,S], dim=-1)
-    D = torch.cat(D)
-    return XYS, D, scores
-
-def extract_keypoints(args, root_to_current_dataset):
+def extract_keypoints(args, root_to_current_dataset, scale_f):
     iscuda = common.torch_set_gpu(args.gpu)
-    output_folder = 'r2d2_features'
+    output_folder = 'r2d2_features_' + str(scale_f)
     rgb_folder = 'rgb.txt'
     root_to_save_features = root_to_current_dataset+ '/' + output_folder
     if not os.path.exists(root_to_save_features):
@@ -174,28 +148,25 @@ def extract_keypoints(args, root_to_current_dataset):
         rel_thr = args.reliability_thr, 
         rep_thr = args.repeatability_thr)
     
-    imgs_under_current_folder = np.loadtxt(Path(root_to_current_dataset,'rgb.txt'), dtype=str)
+    imgs_under_current_folder = np.loadtxt(Path(root_to_current_dataset,rgb_folder), dtype=str)
     for img in imgs_under_current_folder:
         img_path = img[-1]
-        img_name = img[0].split('/')[-1]
-        print(f"\nExtracting features for {img_path}")
+        img_name = img[-1].split('/')[-1]
+        # print(f"\nExtracting features for {img_path}")
         img = Image.open(Path(root_to_current_dataset, img_path)).convert('RGB')
             
         img = norm_RGB(img)[None] 
         if iscuda: img = img.cuda()
         
         # extract keypoints/descriptors for a single image
-        xys, desc, scores = extract_and_save_originalscale( net, img, detector)
+        desc  = extract_and_save_byscale( net, img, detector, scale_f)
 
-        xys = xys.cpu().numpy()
-        desc = desc.cpu().numpy()
-        scores = scores.cpu().numpy()
-        idxs = scores.argsort()[-args.top_k or None:]
+        desc = desc.cpu().numpy().squeeze()
         
         outpath = Path(root_to_save_features,img_name[:-4])
         
-        print(f"Saving {len(idxs)} keypoints to {outpath}")
-        np.save(outpath, desc[idxs])
+        print(f"Saving features to {outpath}")
+        np.save(outpath, desc)
 
         #np.savez(open(outpath,'wb'), 
          #   imsize = (W,H),
@@ -227,11 +198,13 @@ if __name__ == '__main__':
     parser.add_argument("--gpu", type=int, nargs='+', default=[0], help='use -1 for CPU')
 
     parser.add_argument("--datasets", type=str)
+    parser.add_argument("--scale", type=int, help='the factor to downscale the image')
+
     args = parser.parse_args()
 
     all_datasets = np.loadtxt(args.datasets,dtype=str)
     root = '/local/home/zjiang/data/eth3d/training'
     for dataset in all_datasets:
         root_to_current_dataset = root + '/' + dataset
-        extract_keypoints(args, root_to_current_dataset)
+        extract_keypoints(args, root_to_current_dataset, args.scale)
 
